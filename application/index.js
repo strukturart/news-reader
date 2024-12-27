@@ -36,7 +36,6 @@ localforage
   .getItem("downloadList")
   .then((e) => {
     downloadList = e;
-    console.log(downloadList);
   })
   .catch((downloadList = []));
 
@@ -85,8 +84,6 @@ try {
       type: "module",
     })
     .then((registration) => {
-      console.log("Service Worker registered successfully.");
-
       // Check if a service worker is waiting to be activated
       if (registration.waiting) {
         console.log("A waiting Service Worker is already in place.");
@@ -138,7 +135,7 @@ let default_settings = {
     "https://raw.githubusercontent.com/strukturart/feedolin/master/example.opml",
   "opml_local": "",
   "proxy_url": "https://api.cors.lol/?url=",
-  "cache_time": 3600000,
+  "cache_time": 3600,
 };
 //store all articles id to compare
 let articlesID = [];
@@ -412,6 +409,8 @@ const handleHttpError = (status) => {
   console.error(`HTTP Error: Status ${status}`);
   side_toaster("OPML file not reachable", 8000);
 
+  load_cached_feeds();
+
   // Route back to start if on intro
   let r = m.route.get();
   if (r.startsWith("/intro")) {
@@ -422,6 +421,8 @@ const handleHttpError = (status) => {
 const handleRequestError = () => {
   console.error("Network error occurred during the request.");
   side_toaster("OPML file not reachable", 8000);
+
+  load_cached_feeds();
 
   // Route back to start if on intro
   let r = m.route.get();
@@ -637,6 +638,7 @@ const fetchContent = async (feed_download_list) => {
 
       xhr.ontimeout = function () {
         console.error("Request timed out");
+        e.error = "timeout";
         completedFeeds++;
         checkIfAllFeedsLoaded();
       };
@@ -754,13 +756,16 @@ const fetchContent = async (feed_download_list) => {
 
           completedFeeds++; // Increment the counter
           checkIfAllFeedsLoaded(); // Check if all feeds are done
-        } catch (e) {
+        } catch (event) {
+          e.error = event;
+
           completedFeeds++; // Increment the counter
           checkIfAllFeedsLoaded(); // Check if all feeds are done
         }
       };
 
-      xhr.onerror = function () {
+      xhr.onerror = function (event) {
+        e.error = event;
         completedFeeds++; // Increment the counter in case of error
         checkIfAllFeedsLoaded();
       };
@@ -873,6 +878,33 @@ let start_loading = () => {
   channel_filter = localStorage.getItem("last_channel_filter");
 };
 
+let load_cached_feeds = () => {
+  localforage
+    .getItem("articles")
+    .then((value) => {
+      articles = value;
+
+      articles.sort((a, b) => new Date(b.isoDate) - new Date(a.isoDate));
+
+      articles.forEach((e) => {
+        if (channels.indexOf(e.channel) === -1 && e.channel) {
+          channels.push(e.channel);
+        }
+      });
+
+      if (channels.length) {
+        channel_filter =
+          localStorage.getItem("last_channel_filter") || channels[0];
+      }
+
+      m.route.set("/start?index=0");
+      document.querySelector("body").classList.add("cache");
+
+      side_toaster("Cached feeds loaded", 4000);
+    })
+    .catch((err) => {});
+};
+
 localforage
   .getItem("settings")
   .then(function (value) {
@@ -887,7 +919,7 @@ localforage
     }
     settings = value;
     //todo set value in settings view, default is 1h
-    settings.cache_time = settings.cache_time || 3600000;
+    settings.cache_time = settings.cache_time || 3600;
 
     if (settings.last_update) {
       status.last_update_duration =
@@ -914,43 +946,20 @@ localforage
       if (isOnline && status.last_update_duration > settings.cache_time) {
         start_loading();
         side_toaster("Load feeds", 4000);
+
+        //load mastodon acc info
+        if (settings.mastodon_token) {
+          mastodon_account_info(
+            settings.mastodon_server_url,
+            settings.mastodon_token
+          )
+            .then((f) => {
+              status.mastodon_logged = f.display_name;
+            })
+            .catch((e) => {});
+        }
       } else {
-        localforage
-          .getItem("articles")
-          .then((value) => {
-            articles = value;
-
-            articles.sort((a, b) => new Date(b.isoDate) - new Date(a.isoDate));
-
-            articles.forEach((e) => {
-              if (channels.indexOf(e.channel) === -1 && e.channel) {
-                channels.push(e.channel);
-              }
-            });
-
-            if (channels.length) {
-              channel_filter =
-                localStorage.getItem("last_channel_filter") || channels[0];
-            }
-
-            m.route.set("/start?index=0");
-            document.querySelector("body").classList.add("cache");
-
-            side_toaster("Cached feeds loaded", 4000);
-
-            //load mastodon
-            if (settings.mastodon_token) {
-              mastodon_account_info(
-                settings.mastodon_server_url,
-                settings.mastodon_token
-              )
-                .then((f) => {
-                  status.mastodon_logged = f.display_name;
-                })
-                .catch((e) => {});
-            }
-          })
-          .catch((err) => {});
+        load_cached_feeds();
       }
     });
   })
@@ -1729,6 +1738,13 @@ const AudioPlayerView = {
 
     if (status.notKaiOS) {
       top_bar("<img src='assets/icons/back.svg'>", "", "");
+
+      document.addEventListener(
+        "touchstart",
+        AudioPlayerView.touchStartHandler
+      );
+      document.addEventListener("touchmove", AudioPlayerView.touchMoveHandler);
+      document.addEventListener("touchend", AudioPlayerView.touchEndHandler);
     }
 
     document
@@ -1781,14 +1797,17 @@ const AudioPlayerView = {
     }
 
     function startContinuousSeek(direction) {
-      if (seekInterval) return; // Prevent multiple intervals
-      AudioPlayerView.seek(direction);
-
-      // Start a repeating interval for continuous seeking
-      seekInterval = setInterval(() => {
+      let r = m.route.get();
+      if (r.startsWith("/Audio")) {
+        if (seekInterval) return; // Prevent multiple intervals
         AudioPlayerView.seek(direction);
-        document.querySelector(".audio-info").style.padding = "20px";
-      }, 1000);
+
+        // Start a repeating interval for continuous seeking
+        seekInterval = setInterval(() => {
+          AudioPlayerView.seek(direction);
+          document.querySelector(".audio-info").style.padding = "20px";
+        }, 1000);
+      }
     }
 
     function stopContinuousSeek() {
@@ -1801,7 +1820,17 @@ const AudioPlayerView = {
   },
 
   onremove: () => {
-    document.removeEventListener("keydown", AudioPlayerView.handleKeydown);
+    if (status.notKaiOS) {
+      document.removeEventListener(
+        "touchstart",
+        AudioPlayerView.touchStartHandler
+      );
+      document.removeEventListener(
+        "touchmove",
+        AudioPlayerView.touchMoveHandler
+      );
+      document.removeEventListener("touchend", AudioPlayerView.touchEndHandler);
+    }
   },
 
   handleKeydown: (e) => {
@@ -1818,7 +1847,7 @@ const AudioPlayerView = {
     if (AudioPlayerView.isPlaying) {
       globalAudioElement.pause();
     } else {
-      globalAudioElement.play().catch(() => {}); // Handle play promise rejection
+      globalAudioElement.play();
     }
     AudioPlayerView.isPlaying = !AudioPlayerView.isPlaying;
   },
